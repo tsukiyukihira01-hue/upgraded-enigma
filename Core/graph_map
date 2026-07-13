@@ -1,0 +1,97 @@
+from typing import Dict, List, Tuple, Optional
+import heapq
+import math
+import json
+import random
+
+class GraphNode:
+    __slots__ = ("id", "x", "y", "type", "data")
+    def __init__(self, id: int, x: float, y: float, type: str = "plains", data: dict = None):
+        self.id = id
+        self.x = x
+        self.y = y
+        self.type = type
+        self.data = data or {}
+
+class GraphMap:
+    """
+    Network map for grand strategy. Not grid. Nodes are provinces, cities, systems.
+    Edges are roads, sea lanes, hyperlanes. Fully serializable to SQLite.
+    """
+    def __init__(self):
+        self.nodes: Dict[int, GraphNode] = {}
+        self.adj: Dict[int, List[Tuple[int, float]]] = {}  # node_id -> [(neighbor_id, cost)]
+
+    def add_node(self, node: GraphNode):
+        self.nodes[node.id] = node
+        self.adj.setdefault(node.id, [])
+
+    def add_edge(self, a: int, b: int, cost: float = 1.0, bidirectional: bool = True):
+        self.adj.setdefault(a, []).append((b, cost))
+        if bidirectional:
+            self.adj.setdefault(b, []).append((a, cost))
+
+    def neighbors(self, node_id: int):
+        return self.adj.get(node_id, [])
+
+    def shortest_path(self, start: int, goal: int) -> Optional[List[int]]:
+        """A* with Euclidean heuristic. Fast for thousands of nodes."""
+        if start not in self.nodes or goal not in self.nodes:
+            return None
+        open_q = [(0, start)]
+        came_from = {}
+        g_score = {start: 0}
+        def heuristic(n):
+            a = self.nodes[n]; b = self.nodes[goal]
+            return math.hypot(a.x - b.x, a.y - b.y)
+        while open_q:
+            _, cur = heapq.heappop(open_q)
+            if cur == goal:
+                path = [cur]
+                while cur in came_from:
+                    cur = came_from[cur]
+                    path.append(cur)
+                return path[::-1]
+            for nb, cost in self.adj[cur]:
+                ng = g_score[cur] + cost
+                if ng < g_score.get(nb, 1e18):
+                    g_score[nb] = ng
+                    f = ng + heuristic(nb)
+                    came_from[nb] = cur
+                    heapq.heappush(open_q, (f, nb))
+        return None
+
+    def generate_random_network(self, count=120, avg_degree=3, width=1000, height=700):
+        for i in range(count):
+            self.add_node(GraphNode(i, random.uniform(0, width), random.uniform(0, height),
+                                    type=random.choice(["plains","hills","forest","city","port"])))
+        ids = list(self.nodes.keys())
+        # guarantee connectivity with a random spanning chain sorted by x
+        ids_by_x = sorted(ids, key=lambda nid: self.nodes[nid].x)
+        for a, b in zip(ids_by_x, ids_by_x[1:]):
+            cost = math.hypot(self.nodes[a].x - self.nodes[b].x,
+                              self.nodes[a].y - self.nodes[b].y) / 100.0 + random.uniform(0.5, 2.0)
+            self.add_edge(a, b, cost)
+
+        # add organic extra edges to reach avg_degree
+        for nid in ids:
+            dists = sorted(ids, key=lambda oid: math.hypot(self.nodes[nid].x - self.nodes[oid].x,
+                                                            self.nodes[nid].y - self.nodes[oid].y))
+            for oid in dists[1:1+avg_degree]:
+                if oid not in [n for n,_ in self.adj[nid]]:
+                    cost = math.hypot(self.nodes[nid].x - self.nodes[oid].x,
+                                      self.nodes[nid].y - self.nodes[oid].y) / 100.0
+                    self.add_edge(nid, oid, cost)
+
+    def to_rows(self):
+        """For bulk SQL insert"""
+        node_rows = [(n.id, n.x, n.y, n.type, json.dumps(n.data)) for n in self.nodes.values()]
+        edge_rows = []
+        seen = set()
+        for a, lst in self.adj.items():
+            for b, cost in lst:
+                if (b, a) in seen:
+                    continue
+                seen.add((a, b))
+                edge_rows.append((a, b, cost))
+        return node_rows, edge_rows
